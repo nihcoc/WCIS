@@ -1,610 +1,602 @@
-
+/*
+ * ╔══════════════════════════════════════════════════╗
+ * ║       ESP32 WATER VALVE SCHEDULER                ║
+ * ║  Servo Pin: 17 | Enable Pin: 22                  ║
+ * ║  Dual daily schedule via Wi-Fi web interface     ║
+ * ╚══════════════════════════════════════════════════╝
+ *
+ * Libraries required (install via Arduino Library Manager):
+ *   - ESP32Servo   by Kevin Harrington
+ *   - ArduinoJson  by Benoit Blanchon
+ *
+ * Board: ESP32 Dev Module
+ */
 #include <WiFi.h>
 #include <WebServer.h>
-#include <ESP32Servo.h>
 #include <Preferences.h>
-#include <ArduinoOTA.h>
-#include "time.h"
-
-// ─── USER CONFIG ─────────────────────────────────────────────────────────────
-const char* SSID       = "change";
-const char* PASSWORD   = "change";
-const int   SERVO_PIN  = 17;
-const int   POWER_PIN  = 22;    // controls servo power rail
-const int   POS_OPEN   = -40;
-const int   POS_CLOSED =  90;
-const long  UTC_OFFSET = 4 * 3600;   // UTC+4  (Abu Dhabi / Dubai)
-
-// How long to keep power on after sending the servo signal.
-// 700 ms is enough for a typical servo to travel 130 degrees.
-// Increase to 1000 if your servo is slow or under load.
-#define SERVO_POWER_ON_MS  10000
-
-#define WIFI_CHECK_INTERVAL    5000
-#define WIFI_RECONNECT_TIMEOUT 10000
-// ─────────────────────────────────────────────────────────────────────────────
-
-Servo       myServo;
+#include <ESP32Servo.h>
+#include <ArduinoJson.h>
+#include <time.h>
+// ─── USER CONFIG ────────────────────────────────────────────────────────────
+const char* WIFI_SSID      = "change";
+const char* WIFI_PASSWORD  = "chnage";
+const char* NTP_SERVER     = "pool.ntp.org";
+const long  GMT_OFFSET_S   = 14400;   // UTC+4 Dubai — adjust for your timezone
+const int   DAYLIGHT_S     = 0;
+const int SERVO_OPEN_DEG   = -40;      // Angle when valve is OPEN
+const int SERVO_CLOSE_DEG  = 90;       // Angle when valve is CLOSED
+const int VALVE_DURATION_S = 1800;    // Seconds valve stays open (30 min)
+// How long (ms) to wait after writing servo position before assuming travel is done.
+const unsigned long SERVO_TRAVEL_MS = 10000;
+const unsigned long SERVO_ENABLE_SETTLE_MS = 200;
+const unsigned long SERVO_HOLD_CLOSED_MS   = 300;
+const unsigned long SERVO_DISABLE_GAP_MS   = 20;
+const int SERVO_PIN        = 17;
+const int SERVO_ENABLE_PIN = 22;
+// ────────────────────────────────────────────────────────────────────────────
+// ─── VALVE STATE MACHINE ────────────────────────────────────────────────────
+enum ValveState {
+  VS_IDLE,
+  VS_ENABLING,
+  VS_MOVING_OPEN,
+  VS_OPEN,
+  VS_MOVING_CLOSE,
+  VS_POWERING_DOWN,
+  VS_DISABLE_WAIT
+};
+ValveState    valveState      = VS_IDLE;
+unsigned long stateEnteredAt  = 0;
+unsigned long valveOpenAt     = 0;
+bool          pendingClose    = false;
+Servo       waterValve;
 WebServer   server(80);
 Preferences prefs;
-String      currentState  = "unknown";
-bool        ntpSynced     = false;
-
-unsigned long lastWifiCheckMs   = 0;
-unsigned long reconnectStartMs  = 0;
-bool          reconnecting      = false;
-
-// ─── SCHEDULE STORAGE ────────────────────────────────────────────────────────
-#define MAX_SCHEDULES 10
-
+// ─── SCHEDULE ───────────────────────────────────────────────────────────────
 struct Schedule {
-  uint8_t startHour, startMin;
-  uint8_t endHour,   endMin;
-  uint8_t days;
   bool    enabled;
+  uint8_t hour;
+  uint8_t minute;
 };
-
-Schedule schedules[MAX_SCHEDULES];
-int      scheduleCount      = 0;
-bool     lastScheduleActive = false;
-unsigned long lastCheckMs   = 0;
-
-void saveSchedules() {
-  prefs.begin("sched", false);
-  prefs.putInt("cnt", scheduleCount);
-  prefs.putBytes("data", schedules, sizeof(schedules));
+Schedule sched[2];
+int lastMinuteChecked = -1;
+// ─── NVS HELPERS ────────────────────────────────────────────────────────────
+void saveSchedule() {
+  prefs.begin("valve", false);
+  for (int i = 0; i < 2; i++) {
+    String p = "s" + String(i);
+    prefs.putBool((p + "en").c_str(), sched[i].enabled);
+    prefs.putUChar((p + "h").c_str(), sched[i].hour);
+    prefs.putUChar((p + "m").c_str(), sched[i].minute);
+  }
   prefs.end();
 }
-
-void loadSchedules() {
-  prefs.begin("sched", true);
-  scheduleCount = constrain(prefs.getInt("cnt", 0), 0, MAX_SCHEDULES);
-  if (scheduleCount > 0)
-    prefs.getBytes("data", schedules, sizeof(schedules));
+void loadSchedule() {
+  prefs.begin("valve", true);
+  for (int i = 0; i < 2; i++) {
+    String p = "s" + String(i);
+    sched[i].enabled = prefs.getBool((p + "en").c_str(), false);
+    sched[i].hour    = prefs.getUChar((p + "h").c_str(), 6 + i * 12);
+    sched[i].minute  = prefs.getUChar((p + "m").c_str(), 0);
+  }
   prefs.end();
 }
-
-// ─── SERVO + POWER GATING ────────────────────────────────────────────────────
-int degreesToMicros(int deg) {
-  return (int)(544.0 + (deg * (2400.0 - 544.0) / 180.0));
+// ─── TIME HELPERS ───────────────────────────────────────────────────────────
+bool tryGetLocalTimeFast(struct tm* out) {
+  time_t now = time(nullptr);
+  if (now < 24 * 60 * 60) {
+    return false;
+  }
+  localtime_r(&now, out);
+  return true;
 }
-
-void moveServo(int pos, String state) {
-  Serial.printf("Servo -> %s  (%d deg)  [power ON]\n", state.c_str(), pos);
-
-  // 1. Power the servo rail
-  digitalWrite(POWER_PIN, HIGH);
-
-  // 2. Brief settling time – lets the servo power up before receiving signal
-  millis(10000);
-
-  // 3. Send target position
-  int us = constrain(degreesToMicros(pos), 400, 2500);
-  myServo.writeMicroseconds(us);
-
-  // 4. Wait for physical movement to complete
-  millis(SERVO_POWER_ON_MS);
-
-  // 5. Cut power – servo holds position mechanically (or via internal lock)
-  digitalWrite(POWER_PIN, LOW);
-
-  currentState = state;
-  Serial.printf("Servo reached %s  [power OFF]\n", state.c_str());
+// ─── VALVE HELPERS ──────────────────────────────────────────────────────────
+void beginCloseMotion(unsigned long now) {
+  pendingClose = false;
+  valveState = VS_MOVING_CLOSE;
+  stateEnteredAt = now;
+  if (!waterValve.attached()) {
+    waterValve.attach(SERVO_PIN);
+  }
+  digitalWrite(SERVO_ENABLE_PIN, HIGH);
+  waterValve.write(SERVO_CLOSE_DEG);
 }
-
-// ─── WIFI AUTO-RECONNECT ─────────────────────────────────────────────────────
-void startReconnect() {
-  Serial.println("[WiFi] Connection lost. Reconnecting...");
-  WiFi.disconnect(true);
-  delay(100);
-  WiFi.begin(SSID, PASSWORD);
-  reconnecting     = true;
-  reconnectStartMs = millis();
+bool requestOpen() {
+  if (valveState != VS_IDLE) {
+    return false;
+  }
+  Serial.println("[VALVE] Open requested");
+  pendingClose = false;
+  valveState = VS_ENABLING;
+  stateEnteredAt = millis();
+  digitalWrite(SERVO_ENABLE_PIN, HIGH);
+  return true;
 }
-
-void handleWifi() {
-  if (millis() - lastWifiCheckMs < WIFI_CHECK_INTERVAL) return;
-  lastWifiCheckMs = millis();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    if (reconnecting) {
-      reconnecting = false;
-      ntpSynced    = false;
-      Serial.printf("[WiFi] Reconnected! IP: %s\n", WiFi.localIP().toString().c_str());
-      configTime(UTC_OFFSET, 0, "pool.ntp.org", "time.nist.gov");
-      struct tm t;
-      if (getLocalTime(&t)) {
-        ntpSynced = true;
-        Serial.printf("[NTP]  Re-synced: %02d:%02d:%02d\n", t.tm_hour, t.tm_min, t.tm_sec);
+bool requestClose() {
+  if (valveState == VS_IDLE) {
+    return false;
+  }
+  if (valveState == VS_OPEN) {
+    Serial.println("[VALVE] Close requested");
+    beginCloseMotion(millis());
+    return true;
+  }
+  pendingClose = true;
+  return true;
+}
+// ─── NON-BLOCKING STATE MACHINE ─────────────────────────────────────────────
+void updateValveStateMachine() {
+  unsigned long now = millis();
+  switch (valveState) {
+    case VS_IDLE:
+      break;
+    case VS_ENABLING:
+      if (now - stateEnteredAt >= SERVO_ENABLE_SETTLE_MS) {
+        waterValve.attach(SERVO_PIN);
+        waterValve.write(SERVO_OPEN_DEG);
+        valveState = VS_MOVING_OPEN;
+        stateEnteredAt = now;
+        Serial.println("[VALVE] Moving to OPEN");
       }
-    }
+      break;
+    case VS_MOVING_OPEN:
+      if (now - stateEnteredAt >= SERVO_TRAVEL_MS) {
+        valveState = VS_OPEN;
+        valveOpenAt = now;
+        Serial.println("[VALVE] OPEN");
+        if (pendingClose) {
+          Serial.println("[VALVE] Pending close detected");
+          beginCloseMotion(now);
+        }
+      }
+      break;
+    case VS_OPEN:
+      if (pendingClose ||
+          (now - valveOpenAt >= (unsigned long)VALVE_DURATION_S * 1000UL)) {
+        Serial.println("[VALVE] Starting close sequence");
+        beginCloseMotion(now);
+      }
+      break;
+    case VS_MOVING_CLOSE:
+      if (now - stateEnteredAt >= SERVO_TRAVEL_MS) {
+        valveState = VS_POWERING_DOWN;
+        stateEnteredAt = now;
+        Serial.println("[VALVE] Reached CLOSED, holding...");
+      }
+      break;
+    case VS_POWERING_DOWN:
+      if (now - stateEnteredAt >= SERVO_HOLD_CLOSED_MS) {
+        waterValve.detach();
+        valveState = VS_DISABLE_WAIT;
+        stateEnteredAt = now;
+        Serial.println("[VALVE] PWM detached");
+      }
+      break;
+    case VS_DISABLE_WAIT:
+      if (now - stateEnteredAt >= SERVO_DISABLE_GAP_MS) {
+        digitalWrite(SERVO_ENABLE_PIN, LOW);
+        valveState = VS_IDLE;
+        Serial.println("[VALVE] IDLE (power off)");
+      }
+      break;
+  }
+}
+bool isValveOpen() {
+  return valveState == VS_ENABLING ||
+         valveState == VS_MOVING_OPEN ||
+         valveState == VS_OPEN;
+}
+bool isScheduleValueValid(int hour, int minute) {
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+}
+// ─── SCHEDULE CHECK ─────────────────────────────────────────────────────────
+void checkSchedule() {
+  struct tm t;
+  if (!tryGetLocalTimeFast(&t)) {
     return;
   }
-
-  if (!reconnecting) { startReconnect(); return; }
-  if (millis() - reconnectStartMs > WIFI_RECONNECT_TIMEOUT) {
-    Serial.println("[WiFi] Timeout. Retrying...");
-    startReconnect();
+  int currentMin = t.tm_hour * 60 + t.tm_min;
+  if (currentMin == lastMinuteChecked) {
+    return;
+  }
+  lastMinuteChecked = currentMin;
+  for (int i = 0; i < 2; i++) {
+    if (!sched[i].enabled) {
+      continue;
+    }
+    if (currentMin == sched[i].hour * 60 + sched[i].minute) {
+      Serial.printf("[SCHED] Schedule %d fired at %02d:%02d\n", i, t.tm_hour, t.tm_min);
+      requestOpen();
+    }
   }
 }
-
-// ─── SCHEDULE CHECKER ────────────────────────────────────────────────────────
-void checkSchedules() {
-  if (millis() - lastCheckMs < 10000) return;
-  lastCheckMs = millis();
-  if (scheduleCount == 0) return;
-
+// ─── API HANDLERS ───────────────────────────────────────────────────────────
+void addCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+}
+void handleOptions() {
+  addCorsHeaders();
+  server.send(204);
+}
+void handleGetStatus() {
   struct tm t;
-  if (!getLocalTime(&t)) { Serial.println("[Sched] NTP not ready"); return; }
-
-  int     nowMin = t.tm_hour * 60 + t.tm_min;
-  uint8_t dayBit = (uint8_t)(1 << t.tm_wday);
-
-  bool active = false;
-  for (int i = 0; i < scheduleCount && !active; i++) {
-    if (!schedules[i].enabled)         continue;
-    if (!(schedules[i].days & dayBit)) continue;
-    int s = schedules[i].startHour * 60 + schedules[i].startMin;
-    int e = schedules[i].endHour   * 60 + schedules[i].endMin;
-    if (nowMin >= s && nowMin < e) active = true;
+  bool hasTime = tryGetLocalTimeFast(&t);
+  char timeBuf[20] = "Syncing...";
+  if (hasTime) {
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
   }
-
-  if ( active && !lastScheduleActive) moveServo(POS_OPEN,   "open");
-  if (!active &&  lastScheduleActive) moveServo(POS_CLOSED, "closed");
-  lastScheduleActive = active;
-  
-}
-
-// ─── HTML PAGE ────────────────────────────────────────────────────────────────
-const char INDEX_HTML[] PROGMEM =
-
-  "<!DOCTYPE html><html lang='en'><head>"
-  "<meta charset='UTF-8'>"
-  "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
-  "<title>WCIS Control Center</title>"
-  "<link href='https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;500;700&family=Share+Tech+Mono&display=swap' rel='stylesheet'>"
-  "<style>"
-  "*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}"
-  ":root{--bg:#0a0c10;--panel:#10141c;--border:#1e2538;--accent:#00e5ff;--open-c:#00e5ff;--closed-c:#ff4b6e;--text:#c8d6e8;--dim:#4a5568;}"
-  "body{min-height:100vh;background:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:28px 0 48px;font-family:'Rajdhani',sans-serif;color:var(--text);overflow-y:auto;}"
-  "body::before{content:'';position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(0,229,255,0.04) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,255,0.04) 1px,transparent 1px);background-size:40px 40px;animation:gridShift 20s linear infinite;}"
-  "@keyframes gridShift{to{background-position:40px 40px}}"
-  ".wifi-bar{width:min(460px,94vw);display:flex;align-items:center;gap:8px;font-family:'Share Tech Mono',monospace;font-size:10px;letter-spacing:2px;color:var(--dim);margin-bottom:10px;padding:0 2px;}"
-  ".wifi-dot{width:7px;height:7px;border-radius:50%;background:var(--dim);transition:background 0.4s,box-shadow 0.4s;flex-shrink:0;}"
-  ".wifi-bar.online .wifi-dot{background:#39ff7e;box-shadow:0 0 7px #39ff7e;}"
-  ".wifi-bar.online .wifi-label{color:#39ff7e;}"
-  ".wifi-bar.offline .wifi-dot{background:var(--closed-c);box-shadow:0 0 7px var(--closed-c);animation:blink 1s step-start infinite;}"
-  ".wifi-bar.offline .wifi-label{color:var(--closed-c);}"
-  ".wifi-bar.reconnecting .wifi-dot{background:#ffd24b;box-shadow:0 0 7px #ffd24b;animation:blink 0.5s step-start infinite;}"
-  ".wifi-bar.reconnecting .wifi-label{color:#ffd24b;}"
-  "@keyframes blink{50%{opacity:0}}"
-  ".card{position:relative;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:44px 48px 40px;width:min(460px,94vw);box-shadow:0 0 60px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,255,255,0.04);}"
-  ".card::before,.card::after,.card .cbr,.card .cbl{content:'';position:absolute;width:12px;height:12px;border-color:var(--accent);border-style:solid;opacity:0.6;}"
-  ".card::before{top:8px;left:8px;border-width:2px 0 0 2px}"
-  ".card::after{top:8px;right:8px;border-width:2px 2px 0 0}"
-  ".card .cbr{bottom:8px;right:8px;border-width:0 2px 2px 0}"
-  ".card .cbl{bottom:8px;left:8px;border-width:0 0 2px 2px}"
-  ".clock-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}"
-  ".chip{font-family:'Share Tech Mono',monospace;font-size:9px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;}"
-  ".clock{font-family:'Share Tech Mono',monospace;font-size:1.2rem;color:var(--accent);letter-spacing:3px;text-shadow:0 0 10px rgba(0,229,255,0.35);}"
-  "h1{font-size:2rem;font-weight:700;letter-spacing:6px;text-transform:uppercase;color:#fff;margin-bottom:32px;text-align:center;text-shadow:0 0 18px rgba(0,229,255,0.35);}"
-
-  // Servo visualiser
-  ".servo-vis{margin:0 auto 32px;width:120px;height:120px;position:relative}"
-  ".servo-body{width:100%;height:100%;border-radius:50%;border:2px solid var(--border);background:radial-gradient(circle at 35% 35%,#1a2030,#0a0c10);position:relative;box-shadow:0 0 30px rgba(0,229,255,0.08);}"
-  ".servo-arc{position:absolute;inset:8px;border-radius:50%;border:2px dashed rgba(0,229,255,0.15)}"
-  ".servo-arm{position:absolute;top:50%;left:50%;width:46px;height:4px;background:linear-gradient(90deg,var(--accent),rgba(0,229,255,0.3));transform-origin:6px 50%;transform:translateY(-50%) rotate(0deg);transition:transform 0.6s cubic-bezier(0.34,1.56,0.64,1);border-radius:2px;margin-left:-6px;box-shadow:0 0 8px rgba(0,229,255,0.5);}"
-  ".servo-hub{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:14px;height:14px;background:var(--accent);border-radius:50%;box-shadow:0 0 10px var(--accent);}"
-
-  // Power indicator dot next to status
-  ".status-wrap{margin-bottom:28px;display:flex;align-items:center;justify-content:center;gap:10px}"
-  ".status-dot{width:8px;height:8px;border-radius:50%;background:var(--dim);transition:background 0.4s,box-shadow 0.4s;flex-shrink:0}"
-  ".status-text{font-family:'Share Tech Mono',monospace;font-size:13px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;transition:color 0.4s}"
-  "body.is-open .status-dot{background:var(--open-c);box-shadow:0 0 8px var(--open-c)}"
-  "body.is-open .status-text{color:var(--open-c)}"
-  "body.is-closed .status-dot{background:var(--closed-c);box-shadow:0 0 8px var(--closed-c)}"
-  "body.is-closed .status-text{color:var(--closed-c)}"
-
-  // Power pill badge
-  ".power-pill{"
-    "display:inline-flex;align-items:center;gap:5px;"
-    "font-family:'Share Tech Mono',monospace;font-size:9px;letter-spacing:2px;"
-    "border-radius:10px;padding:2px 8px;margin-left:8px;"
-    "border:1px solid var(--border);color:var(--dim);"
-    "transition:all 0.3s;"
-  "}"
-  ".power-pill .pdot{width:5px;height:5px;border-radius:50%;background:var(--dim);transition:all 0.3s;}"
-  ".power-pill.on{border-color:#ffd24b;color:#ffd24b;}"
-  ".power-pill.on .pdot{background:#ffd24b;box-shadow:0 0 5px #ffd24b;}"
-
-  ".btn-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}"
-  ".btn{padding:18px 10px;border:1.5px solid currentColor;border-radius:3px;background:transparent;cursor:pointer;font-family:'Rajdhani',sans-serif;font-size:1.1rem;font-weight:700;letter-spacing:4px;text-transform:uppercase;transition:background 0.2s,box-shadow 0.2s,transform 0.1s;position:relative;overflow:hidden;}"
-  ".btn::after{content:'';position:absolute;inset:0;background:currentColor;opacity:0;transition:opacity 0.2s}"
-  ".btn:hover::after{opacity:0.08}"
-  ".btn:active{transform:scale(0.97)}"
-  ".btn:active::after{opacity:0.16}"
-  ".btn-open{color:var(--open-c)}"
-  ".btn-closed{color:var(--closed-c)}"
-  ".btn-open.active{background:rgba(0,229,255,0.12);box-shadow:0 0 20px rgba(0,229,255,0.25)}"
-  ".btn-closed.active{background:rgba(255,75,110,0.12);box-shadow:0 0 20px rgba(255,75,110,0.25)}"
-  ".btn:disabled{opacity:0.4;cursor:not-allowed;transform:none!important;}"
-  ".btn-icon{display:block;font-size:1.5rem;margin-bottom:4px}"
-  ".readout{margin-top:24px;font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--dim);letter-spacing:2px;text-align:center;}"
-  ".readout span{color:var(--accent)}"
-  ".divider{border:none;border-top:1px solid var(--border);margin:28px 0}"
-  ".sched-title-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}"
-  ".sched-badge{font-family:'Share Tech Mono',monospace;font-size:10px;background:rgba(0,229,255,0.08);color:var(--accent);border:1px solid rgba(0,229,255,0.25);border-radius:10px;padding:2px 9px;}"
-  ".sched-list{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}"
-  ".sched-item{display:flex;align-items:center;gap:10px;background:rgba(0,229,255,0.03);border:1px solid var(--border);border-radius:3px;padding:10px 12px;}"
-  ".sched-time{font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--text);white-space:nowrap;min-width:118px;}"
-  ".sched-days{display:flex;gap:4px;flex:1;flex-wrap:wrap}"
-  ".dp{font-family:'Share Tech Mono',monospace;font-size:9px;width:22px;height:22px;display:flex;align-items:center;justify-content:center;border-radius:50%;border:1px solid var(--border);color:var(--dim);}"
-  ".dp.on{border-color:var(--accent);color:var(--accent);background:rgba(0,229,255,0.1)}"
-  ".del-btn{background:transparent;border:1px solid rgba(255,75,110,0.35);color:rgba(255,75,110,0.6);border-radius:3px;width:26px;height:26px;cursor:pointer;font-size:13px;flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all 0.2s;line-height:1;}"
-  ".del-btn:hover{background:rgba(255,75,110,0.1);border-color:var(--closed-c);color:var(--closed-c)}"
-  ".empty-sched{font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--dim);letter-spacing:2px;text-align:center;padding:18px 0;}"
-  ".sched-form{background:rgba(0,0,0,0.25);border:1px solid var(--border);border-radius:3px;padding:18px 16px;}"
-  ".form-lbl{font-family:'Share Tech Mono',monospace;font-size:9px;letter-spacing:2px;color:var(--dim);display:block;margin-bottom:6px;text-transform:uppercase;}"
-  ".time-row{display:flex;align-items:flex-end;gap:10px;margin-bottom:14px}"
-  ".time-field{flex:1}"
-  ".time-sep{font-family:'Share Tech Mono',monospace;color:var(--dim);font-size:16px;padding-bottom:9px}"
-  "input[type='time']{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:'Share Tech Mono',monospace;font-size:14px;padding:8px 10px;border-radius:3px;outline:none;transition:border-color 0.2s;color-scheme:dark;}"
-  "input[type='time']:focus{border-color:var(--accent)}"
-  ".days-row{display:flex;gap:6px;margin-bottom:16px;justify-content:space-between}"
-  ".day-cb{display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;flex:1}"
-  ".day-cb input{display:none}"
-  ".day-cb span{font-family:'Share Tech Mono',monospace;font-size:9px;width:100%;max-width:36px;height:30px;display:flex;align-items:center;justify-content:center;border-radius:3px;border:1px solid var(--border);color:var(--dim);transition:all 0.2s;cursor:pointer;user-select:none;}"
-  ".day-cb input:checked+span{border-color:var(--accent);color:var(--accent);background:rgba(0,229,255,0.1);box-shadow:0 0 8px rgba(0,229,255,0.15);}"
-  ".btn-add{width:100%;padding:13px;border:1.5px solid var(--accent);border-radius:3px;background:transparent;cursor:pointer;font-family:'Rajdhani',sans-serif;font-size:1rem;font-weight:700;letter-spacing:4px;text-transform:uppercase;color:var(--accent);transition:background 0.2s,box-shadow 0.2s,transform 0.1s;}"
-  ".btn-add:hover{background:rgba(0,229,255,0.08);box-shadow:0 0 20px rgba(0,229,255,0.2)}"
-  ".btn-add:active{transform:scale(0.98)}"
-  ".toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(80px);background:rgba(16,20,28,0.96);border:1px solid var(--border);border-radius:3px;padding:10px 22px;font-family:'Share Tech Mono',monospace;font-size:12px;letter-spacing:2px;color:var(--text);transition:transform 0.35s cubic-bezier(0.34,1.56,0.64,1),opacity 0.35s;opacity:0;pointer-events:none;white-space:nowrap;z-index:99;}"
-  ".toast.show{transform:translateX(-50%) translateY(0);opacity:1}"
-  "</style></head><body>"
-
-  "<div class='wifi-bar' id='wifiBar'>"
-    "<div class='wifi-dot'></div>"
-    "<span class='wifi-label' id='wifiLabel'>CHECKING...</span>"
-  "</div>"
-
-  "<div class='card'>"
-    "<div class='cbr'></div><div class='cbl'></div>"
-    "<div class='clock-row'>"
-      "<span class='chip'>ESP32 &middot; SERVO</span>"
-      "<span class='clock' id='clock'>--:--:--</span>"
-    "</div>"
-    "<h1>Gate Control</h1>"
-    "<div class='servo-vis'>"
-      "<div class='servo-body'>"
-        "<div class='servo-arc'></div>"
-        "<div class='servo-arm' id='arm'></div>"
-        "<div class='servo-hub'></div>"
-      "</div>"
-    "</div>"
-    "<div class='status-wrap'>"
-      "<div class='status-dot'></div>"
-      "<div class='status-text' id='statusText'>--</div>"
-      "<span class='power-pill' id='powerPill'><span class='pdot'></span>PWR</span>"
-    "</div>"
-    "<div class='btn-row'>"
-      "<button class='btn btn-open' id='btnOpen' onclick='sendCmd(\"open\")'>"
-        "<span class='btn-icon'>&#x2302;</span>OPEN"
-      "</button>"
-      "<button class='btn btn-closed' id='btnClosed' onclick='sendCmd(\"closed\")'>"
-        "<span class='btn-icon'>&#x229E;</span>CLOSE"
-      "</button>"
-    "</div>"
-    "<div class='readout'>POS_OPEN <span>-40&deg;</span> &nbsp;|&nbsp; POS_CLOSED <span>90&deg;</span></div>"
-    "<hr class='divider'>"
-    "<div class='sched-title-row'>"
-      "<span class='chip'>WEEKLY SCHEDULES</span>"
-      "<span class='sched-badge' id='schedBadge'>0 active</span>"
-    "</div>"
-    "<div class='sched-list' id='schedList'>"
-      "<div class='empty-sched'>No schedules yet</div>"
-    "</div>"
-    "<div class='sched-form'>"
-      "<div class='time-row'>"
-        "<div class='time-field'>"
-          "<label class='form-lbl' for='tStart'>Open at</label>"
-          "<input type='time' id='tStart' value='08:00'>"
-        "</div>"
-        "<div class='time-sep'>&rarr;</div>"
-        "<div class='time-field'>"
-          "<label class='form-lbl' for='tEnd'>Close at</label>"
-          "<input type='time' id='tEnd' value='09:00'>"
-        "</div>"
-      "</div>"
-      "<div class='days-row'>"
-        "<label class='day-cb'><input type='checkbox' value='2'  checked><span>Mo</span></label>"
-        "<label class='day-cb'><input type='checkbox' value='4'  checked><span>Tu</span></label>"
-        "<label class='day-cb'><input type='checkbox' value='8'  checked><span>We</span></label>"
-        "<label class='day-cb'><input type='checkbox' value='16' checked><span>Th</span></label>"
-        "<label class='day-cb'><input type='checkbox' value='32' checked><span>Fr</span></label>"
-        "<label class='day-cb'><input type='checkbox' value='64'><span>Sa</span></label>"
-        "<label class='day-cb'><input type='checkbox' value='1' ><span>Su</span></label>"
-      "</div>"
-      "<button class='btn-add' onclick='addSchedule()'>+ ADD SCHEDULE</button>"
-    "</div>"
-  "</div>"
-
-  "<div class='toast' id='toast'></div>"
-
-  "<script>"
-  "var DISP_LABELS=['Mo','Tu','We','Th','Fr','Sa','Su'];"
-  "var DISP_BITS=[2,4,8,16,32,64,1];"
-  "var toastTimer;"
-  "var busy=false;"  // blocks double-clicks during servo move
-
-  "function armAngle(deg){return ((deg+40)/110)*100-50;}"
-
-  "function setState(state){"
-    "document.body.className='is-'+state;"
-    "document.getElementById('statusText').textContent=state.toUpperCase();"
-    "document.getElementById('btnOpen').classList.toggle('active',state==='open');"
-    "document.getElementById('btnClosed').classList.toggle('active',state==='closed');"
-    "var angle=state==='open'?armAngle(-40):armAngle(90);"
-    "document.getElementById('arm').style.transform='translateY(-50%) rotate('+angle+'deg)';"
-  "}"
-
-  // Show power-on pill while servo is moving, then hide
-  "function showPowerBusy(ms){"
-    "var pill=document.getElementById('powerPill');"
-    "var btns=document.querySelectorAll('.btn');"
-    "pill.classList.add('on');"
-    "busy=true;"
-    "for(var i=0;i<btns.length;i++) btns[i].disabled=true;"
-    "setTimeout(function(){"
-      "pill.classList.remove('on');"
-      "busy=false;"
-      "for(var i=0;i<btns.length;i++) btns[i].disabled=false;"
-    "},ms);"
-  "}"
-
-  "function showToast(msg){"
-    "var t=document.getElementById('toast');"
-    "t.textContent=msg;"
-    "t.classList.add('show');"
-    "clearTimeout(toastTimer);"
-    "toastTimer=setTimeout(function(){t.classList.remove('show');},2400);"
-  "}"
-
-  "function sendCmd(state){"
-    "if(busy){showToast('SERVO MOVING...');return;}"
-    "showPowerBusy(900);"   // match SERVO_POWER_ON_MS + 80ms settle + margin
-    "fetch('/'+state)"
-      ".then(function(r){"
-        "if(r.ok){setState(state);showToast('SERVO -> '+state.toUpperCase()+' OK');}"
-        "else{showToast('ERROR '+r.status);}"
-      "})"
-      ".catch(function(){showToast('CONNECTION LOST');});"
-  "}"
-
-  "function updateWifi(){"
-    "fetch('/wifistatus')"
-      ".then(function(r){return r.text();})"
-      ".then(function(s){"
-        "var bar=document.getElementById('wifiBar');"
-        "var lbl=document.getElementById('wifiLabel');"
-        "bar.className='wifi-bar '+s;"
-        "if(s==='online')lbl.textContent='WIFI CONNECTED';"
-        "else if(s==='reconnecting')lbl.textContent='RECONNECTING...';"
-        "else lbl.textContent='WIFI OFFLINE';"
-      "})"
-      ".catch(function(){});"
-  "}"
-  "setInterval(updateWifi,4000);updateWifi();"
-
-  "function updateClock(){"
-    "fetch('/time')"
-      ".then(function(r){return r.text();})"
-      ".then(function(t){document.getElementById('clock').textContent=t;})"
-      ".catch(function(){});"
-  "}"
-  "setInterval(updateClock,1000);updateClock();"
-
-  "function loadSchedules(){"
-    "fetch('/schedules')"
-      ".then(function(r){return r.json();})"
-      ".then(function(arr){renderSchedules(arr);})"
-      ".catch(function(){});"
-  "}"
-
-  "function renderSchedules(arr){"
-    "var el=document.getElementById('schedList');"
-    "document.getElementById('schedBadge').textContent=arr.length+' active';"
-    "if(arr.length===0){el.innerHTML='<div class=\"empty-sched\">No schedules yet</div>';return;}"
-    "var html='';"
-    "for(var i=0;i<arr.length;i++){"
-      "var s=arr[i];"
-      "var dayHtml='';"
-      "for(var d=0;d<7;d++){"
-        "var on=(s.days&DISP_BITS[d])?' on':'';"
-        "dayHtml+='<span class=\"dp'+on+'\">'+DISP_LABELS[d]+'</span>';"
-      "}"
-      "html+='<div class=\"sched-item\">'"
-            "+'<div class=\"sched-time\">'+s.start+' &rarr; '+s.end+'</div>'"
-            "+'<div class=\"sched-days\">'+dayHtml+'</div>'"
-            "+'<button class=\"del-btn\" onclick=\"deleteSchedule('+s.id+')\">&#x2715;</button>'"
-            "+'</div>';"
-    "}"
-    "el.innerHTML=html;"
-  "}"
-
-  "function addSchedule(){"
-    "var start=document.getElementById('tStart').value;"
-    "var end=document.getElementById('tEnd').value;"
-    "if(!start||!end){showToast('SET BOTH TIMES');return;}"
-    "if(start>=end){showToast('START MUST BE BEFORE END');return;}"
-    "var cbs=document.querySelectorAll('.day-cb input:checked');"
-    "var days=0;"
-    "for(var i=0;i<cbs.length;i++) days+=parseInt(cbs[i].value);"
-    "if(days===0){showToast('SELECT AT LEAST 1 DAY');return;}"
-    "fetch('/schedule/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'start='+start+'&end='+end+'&days='+days})"
-      ".then(function(r){"
-        "if(r.ok){loadSchedules();showToast('SCHEDULE SAVED');}"
-        "else{r.text().then(function(t){showToast('ERR: '+t);});}"
-      "})"
-      ".catch(function(){showToast('CONNECTION LOST');});"
-  "}"
-
-  "function deleteSchedule(id){"
-    "fetch('/schedule/delete?id='+id)"
-      ".then(function(r){"
-        "if(r.ok){loadSchedules();showToast('SCHEDULE REMOVED');}"
-        "else{showToast('DELETE FAILED');}"
-      "})"
-      ".catch(function(){showToast('CONNECTION LOST');});"
-  "}"
-
-  "fetch('/status').then(function(r){return r.text();}).then(function(s){if(s==='open'||s==='closed'){setState(s);}}).catch(function(){});"
-  "loadSchedules();"
-  "</script></body></html>";
-
-// ─── HTTP HANDLERS ────────────────────────────────────────────────────────────
-void handleRoot()   { server.send(200, "text/html", INDEX_HTML); }
-void handleOpen()   { moveServo(POS_OPEN,   "open");   server.send(200, "text/plain", "OK"); }
-void handleClosed() { moveServo(POS_CLOSED, "closed"); server.send(200, "text/plain", "OK"); }
-void handleStatus() { server.send(200, "text/plain", currentState); }
-
-void handleWifiStatus() {
-  if (WiFi.status() == WL_CONNECTED)
-    server.send(200, "text/plain", "online");
-  else if (reconnecting)
-    server.send(200, "text/plain", "reconnecting");
-  else
-    server.send(200, "text/plain", "offline");
-}
-
-void handleTime() {
-  struct tm t;
-  if (!getLocalTime(&t)) { server.send(200, "text/plain", "--:--:--"); return; }
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-  server.send(200, "text/plain", buf);
-}
-
-void handleGetSchedules() {
-  String json = "[";
-  for (int i = 0; i < scheduleCount; i++) {
-    if (i > 0) json += ",";
-    char buf[80];
-    snprintf(buf, sizeof(buf),
-      "{\"id\":%d,\"start\":\"%02d:%02d\",\"end\":\"%02d:%02d\",\"days\":%d}",
-      i, schedules[i].startHour, schedules[i].startMin,
-         schedules[i].endHour,   schedules[i].endMin,
-         schedules[i].days);
-    json += buf;
+  long remaining = 0;
+  if (valveState == VS_OPEN) {
+    long elapsed = (long)((millis() - valveOpenAt) / 1000UL);
+    remaining = max(0L, (long)VALVE_DURATION_S - elapsed);
   }
-  json += "]";
-  server.send(200, "application/json", json);
-}
-
-void handleAddSchedule() {
-  if (scheduleCount >= MAX_SCHEDULES) { server.send(400, "text/plain", "Max 10 schedules"); return; }
-  String startStr = server.arg("start");
-  String endStr   = server.arg("end");
-  String daysStr  = server.arg("days");
-  if (startStr.length() < 5 || endStr.length() < 5 || daysStr.length() == 0) {
-    server.send(400, "text/plain", "Bad params"); return;
+  StaticJsonDocument<512> doc;
+  doc["valve"] = isValveOpen();
+  doc["state"] = (int)valveState;
+  doc["remaining"] = remaining;
+  doc["time"] = timeBuf;
+  doc["ip"] = WiFi.localIP().toString();
+  JsonArray arr = doc.createNestedArray("schedules");
+  for (int i = 0; i < 2; i++) {
+    JsonObject o = arr.createNestedObject();
+    o["enabled"] = sched[i].enabled;
+    o["hour"] = sched[i].hour;
+    o["minute"] = sched[i].minute;
   }
-  Schedule s;
-  s.startHour = startStr.substring(0,2).toInt();
-  s.startMin  = startStr.substring(3,5).toInt();
-  s.endHour   = endStr.substring(0,2).toInt();
-  s.endMin    = endStr.substring(3,5).toInt();
-  s.days      = (uint8_t)daysStr.toInt();
-  s.enabled   = true;
-  if (s.startHour>23||s.startMin>59||s.endHour>23||s.endMin>59||s.days==0) {
-    server.send(400, "text/plain", "Invalid values"); return;
+  String out;
+  serializeJson(doc, out);
+  addCorsHeaders();
+  server.send(200, "application/json", out);
+}
+void handleSetSchedule() {
+  if (!server.hasArg("plain")) {
+    addCorsHeaders();
+    server.send(400, "text/plain", "No body");
+    return;
   }
-  schedules[scheduleCount++] = s;
-  saveSchedules();
-  server.send(200, "text/plain", "OK");
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    addCorsHeaders();
+    server.send(400, "text/plain", "Bad JSON");
+    return;
+  }
+  int idx    = doc["index"] | -1;
+  int hour   = doc["hour"] | -1;
+  int minute = doc["minute"] | -1;
+  bool en    = doc["enabled"] | false;
+  if (idx < 0 || idx > 1) {
+    addCorsHeaders();
+    server.send(400, "text/plain", "index must be 0 or 1");
+    return;
+  }
+  if (!isScheduleValueValid(hour, minute)) {
+    addCorsHeaders();
+    server.send(400, "text/plain", "hour must be 0-23 and minute 0-59");
+    return;
+  }
+  sched[idx].enabled = en;
+  sched[idx].hour = (uint8_t)hour;
+  sched[idx].minute = (uint8_t)minute;
+  saveSchedule();
+  addCorsHeaders();
+  server.send(200, "application/json", "{\"ok\":true}");
+  Serial.printf("[API] Schedule %d: %02d:%02d en=%d\n",
+    idx, sched[idx].hour, sched[idx].minute, sched[idx].enabled);
 }
-
-void handleDeleteSchedule() {
-  int id = server.arg("id").toInt();
-  if (id < 0 || id >= scheduleCount) { server.send(400, "text/plain", "Bad id"); return; }
-  for (int i = id; i < scheduleCount-1; i++) schedules[i] = schedules[i+1];
-  scheduleCount--;
-  saveSchedules();
-  server.send(200, "text/plain", "OK");
+void handleManualOpen() {
+  bool accepted = requestOpen();
+  addCorsHeaders();
+  server.send(200, "application/json",
+    accepted ? "{\"ok\":true,\"action\":\"opening\"}" :
+               "{\"ok\":true,\"action\":\"ignored\"}");
 }
-
-void handleNotFound() { server.send(404, "text/plain", "Not found"); }
-
-// ─── SETUP ────────────────────────────────────────────────────────────────────
+void handleManualClose() {
+  bool accepted = requestClose();
+  addCorsHeaders();
+  server.send(200, "application/json",
+    accepted ? "{\"ok\":true,\"action\":\"closing_or_queued\"}" :
+               "{\"ok\":true,\"action\":\"ignored\"}");
+}
+// ─── EMBEDDED WEB PAGE ──────────────────────────────────────────────────────
+void handleRoot() {
+  const char* html = R"rawhtml(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>AquaTimer</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Bebas+Neue&display=swap');
+:root{
+  --bg:#0d0f0e;--surface:#141816;--card:#1a1e1b;--border:#2a3028;
+  --accent:#4ade80;--accent2:#86efac;--danger:#f87171;
+  --muted:#4a5c4e;--text:#d1fae5;--text-dim:#6b8c72;
+  --glow:0 0 24px #4ade8044;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;
+  min-height:100vh;padding:24px 16px 48px;overflow-x:hidden;position:relative}
+body::before{content:'';position:fixed;inset:0;
+  background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.06) 2px,rgba(0,0,0,.06) 4px);
+  pointer-events:none;z-index:999}
+body::after{content:'';position:fixed;inset:0;
+  background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);
+  background-size:40px 40px;opacity:.3;pointer-events:none;z-index:0}
+.wrap{max-width:680px;margin:0 auto;position:relative;z-index:1}
+header{text-align:center;margin-bottom:36px;padding-top:12px}
+.logo-row{display:flex;align-items:center;justify-content:center;gap:16px;margin-bottom:6px}
+.pipe{width:60px;height:3px;border-radius:2px;background:linear-gradient(90deg,transparent,var(--accent))}
+.pipe.r{background:linear-gradient(90deg,var(--accent),transparent)}
+h1{font-family:'Bebas Neue',cursive;font-size:clamp(2.4rem,8vw,4rem);letter-spacing:.12em;
+  color:var(--accent);text-shadow:var(--glow);line-height:1}
+.sub{color:var(--text-dim);font-size:.72rem;letter-spacing:.25em;text-transform:uppercase}
+#clock{font-family:'Bebas Neue',cursive;font-size:clamp(3rem,12vw,5.5rem);color:var(--accent2);
+  letter-spacing:.06em;text-align:center;text-shadow:var(--glow);margin:18px 0 8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:22px;
+  margin-bottom:14px;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.5}
+.ctitle{font-size:.62rem;letter-spacing:.3em;text-transform:uppercase;color:var(--text-dim);
+  margin-bottom:16px;display:flex;align-items:center;gap:10px}
+.ctitle::after{content:'';flex:1;height:1px;background:var(--border)}
+.vstatus{display:flex;align-items:center;gap:18px}
+.orb{width:52px;height:52px;border-radius:50%;border:2px solid var(--muted);
+  display:flex;align-items:center;justify-content:center;font-size:1.4rem;transition:all .4s;flex-shrink:0}
+.orb.open{border-color:var(--accent);background:#4ade8020;box-shadow:0 0 20px #4ade8066;animation:pulse 2s infinite}
+.orb.moving{border-color:#facc15;background:#facc1520;box-shadow:0 0 14px #facc1555;animation:pulse-y 1s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 16px #4ade8055}50%{box-shadow:0 0 36px #4ade8099}}
+@keyframes pulse-y{0%,100%{opacity:1}50%{opacity:.5}}
+.vlabel{font-family:'Bebas Neue',cursive;font-size:1.7rem;letter-spacing:.1em;transition:color .3s}
+.vlabel.open{color:var(--accent)}.vlabel.closed{color:var(--muted)}.vlabel.moving{color:#facc15}
+.vsub{font-size:.68rem;color:var(--text-dim);letter-spacing:.08em;margin-top:4px}
+#countdown{font-size:.72rem;color:var(--accent2);letter-spacing:.1em;margin-top:6px;min-height:1.2em}
+.brow{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px}
+button{font-family:'Share Tech Mono',monospace;font-size:.78rem;letter-spacing:.15em;text-transform:uppercase;
+  padding:13px 10px;border-radius:3px;border:1px solid;cursor:pointer;transition:all .2s;background:transparent}
+.bo{border-color:var(--accent);color:var(--accent)}
+.bo:hover,.bo:active{background:var(--accent);color:var(--bg);box-shadow:var(--glow)}
+.bc{border-color:var(--danger);color:var(--danger)}
+.bc:hover,.bc:active{background:var(--danger);color:var(--bg);box-shadow:0 0 20px #f8717155}
+.slot{padding:16px;border:1px solid var(--border);border-radius:3px;margin-bottom:12px;
+  background:var(--surface);transition:border-color .3s}
+.slot.active{border-color:#2a3a2e}
+.sh{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.snum{font-family:'Bebas Neue',cursive;font-size:1.15rem;color:var(--text-dim);letter-spacing:.1em}
+.toggle{position:relative;width:44px;height:24px}
+.toggle input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:var(--border);border-radius:24px;cursor:pointer;transition:.3s}
+.slider::before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;
+  background:var(--muted);border-radius:50%;transition:.3s}
+input:checked+.slider{background:#1f3a26}
+input:checked+.slider::before{transform:translateX(20px);background:var(--accent);box-shadow:0 0 8px var(--accent)}
+.trow{display:flex;align-items:center;gap:10px}
+.tlbl{font-size:.62rem;color:var(--text-dim);letter-spacing:.2em;text-transform:uppercase;min-width:52px}
+.tinp{display:flex;align-items:center;gap:6px}
+.tinp select{background:var(--bg);color:var(--accent);border:1px solid var(--border);border-radius:3px;
+  padding:8px 10px;font-family:'Share Tech Mono',monospace;font-size:1rem;cursor:pointer;
+  appearance:none;-webkit-appearance:none;width:64px;text-align:center}
+.tinp select:focus{outline:none;border-color:var(--accent)}
+.tsep{color:var(--accent);font-size:1.2rem;font-family:'Bebas Neue',cursive}
+.sbar{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;
+  background:var(--surface);border:1px solid var(--border);border-radius:3px;
+  font-size:.62rem;color:var(--text-dim);letter-spacing:.1em;margin-bottom:14px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--accent);
+  box-shadow:0 0 6px var(--accent);animation:blink 2s infinite;display:inline-block;margin-right:6px}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+#toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:var(--card);
+  border:1px solid var(--accent);color:var(--accent);padding:10px 24px;border-radius:3px;
+  font-size:.72rem;letter-spacing:.15em;opacity:0;pointer-events:none;transition:opacity .3s;
+  z-index:1000;white-space:nowrap}
+#toast.show{opacity:1}
+@media(max-width:400px){.brow{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="logo-row">
+    <div class="pipe"></div>
+    <h1>AQUATIMER</h1>
+    <div class="pipe r"></div>
+  </div>
+  <p class="sub">ESP32 &middot; Valve Scheduler &middot; GPIO 17</p>
+</header>
+<div class="sbar">
+  <span><span class="dot"></span>ONLINE</span>
+  <span id="ip-disp">—</span>
+  <span>EN: GPIO22</span>
+</div>
+<div id="clock">--:--:--</div>
+<div class="card">
+  <div class="ctitle">Valve Status</div>
+  <div class="vstatus">
+    <div class="orb" id="orb">💧</div>
+    <div>
+      <div class="vlabel closed" id="vlbl">CLOSED</div>
+      <div class="vsub" id="vsub">Idle</div>
+      <div id="countdown"></div>
+    </div>
+  </div>
+  <div class="brow">
+    <button class="bo" onclick="manualOpen()">&#9654; Open Valve</button>
+    <button class="bc" onclick="manualClose()">&#9632; Close Valve</button>
+  </div>
+</div>
+<div class="card">
+  <div class="ctitle">Daily Schedules</div>
+  <div class="slot" id="slot-0">
+    <div class="sh">
+      <span class="snum">SCHEDULE 01</span>
+      <label class="toggle"><input type="checkbox" id="en0" onchange="saveSched(0)"/><span class="slider"></span></label>
+    </div>
+    <div class="trow">
+      <span class="tlbl">TIME</span>
+      <div class="tinp">
+        <select id="h0" onchange="saveSched(0)"></select>
+        <span class="tsep">:</span>
+        <select id="m0" onchange="saveSched(0)"></select>
+      </div>
+    </div>
+  </div>
+  <div class="slot" id="slot-1">
+    <div class="sh">
+      <span class="snum">SCHEDULE 02</span>
+      <label class="toggle"><input type="checkbox" id="en1" onchange="saveSched(1)"/><span class="slider"></span></label>
+    </div>
+    <div class="trow">
+      <span class="tlbl">TIME</span>
+      <div class="tinp">
+        <select id="h1" onchange="saveSched(1)"></select>
+        <span class="tsep">:</span>
+        <select id="m1" onchange="saveSched(1)"></select>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+<div id="toast"></div>
+<script>
+const VS_IDLE=0,VS_ENABLING=1,VS_MOVING_OPEN=2,VS_OPEN=3,VS_MOVING_CLOSE=4,VS_POWERING_DOWN=5,VS_DISABLE_WAIT=6;
+['h0','h1'].forEach(id=>{
+  const el=document.getElementById(id);
+  for(let i=0;i<24;i++){const o=document.createElement('option');o.value=i;o.textContent=String(i).padStart(2,'0');el.appendChild(o);}
+});
+['m0','m1'].forEach(id=>{
+  const el=document.getElementById(id);
+  for(let i=0;i<60;i++){const o=document.createElement('option');o.value=i;o.textContent=String(i).padStart(2,'0');el.appendChild(o);}
+});
+function toast(msg){
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'),2200);
+}
+function fmtTime(sec){
+  const m=Math.floor(sec/60),s=sec%60;
+  return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')+' remaining';
+}
+function updateValve(valve, state, remaining){
+  const orb=document.getElementById('orb');
+  const lbl=document.getElementById('vlbl');
+  const sub=document.getElementById('vsub');
+  const cd =document.getElementById('countdown');
+  if(state===VS_ENABLING||state===VS_MOVING_OPEN){
+    orb.className='orb moving';
+    lbl.className='vlabel moving';lbl.textContent='OPENING';
+    sub.textContent='Servo moving \xb7 Pin 22 active';
+    cd.textContent='';
+  } else if(state===VS_OPEN){
+    orb.className='orb open';
+    lbl.className='vlabel open';lbl.textContent='OPEN';
+    sub.textContent='Valve open \xb7 Pin 22 active';
+    cd.textContent=remaining>0?fmtTime(remaining):'';
+  } else if(state===VS_MOVING_CLOSE||state===VS_POWERING_DOWN||state===VS_DISABLE_WAIT){
+    orb.className='orb moving';
+    lbl.className='vlabel moving';lbl.textContent='CLOSING';
+    sub.textContent='Servo moving \xb7 Pin 22 active';
+    cd.textContent='';
+  } else {
+    orb.className='orb';
+    lbl.className='vlabel closed';lbl.textContent='CLOSED';
+    sub.textContent='Idle \xb7 Pin 22 off';
+    cd.textContent='';
+  }
+}
+async function fetchStatus(){
+  try{
+    const d=await(await fetch('/api/status')).json();
+    document.getElementById('clock').textContent=d.time;
+    document.getElementById('ip-disp').textContent=d.ip;
+    updateValve(d.valve, d.state, d.remaining);
+    d.schedules.forEach((s,i)=>{
+      document.getElementById('en'+i).checked=s.enabled;
+      document.getElementById('h'+i).value=s.hour;
+      document.getElementById('m'+i).value=s.minute;
+      document.getElementById('slot-'+i).classList.toggle('active',s.enabled);
+    });
+  }catch(e){}
+}
+async function saveSched(idx){
+  const p={index:idx,enabled:document.getElementById('en'+idx).checked,
+    hour:parseInt(document.getElementById('h'+idx).value,10),
+    minute:parseInt(document.getElementById('m'+idx).value,10)};
+  document.getElementById('slot-'+idx).classList.toggle('active',p.enabled);
+  try{
+    const r=await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+    if(!r.ok){throw new Error('save failed');}
+    toast('SCH 0'+(idx+1)+' \u2192 '+String(p.hour).padStart(2,'0')+':'+String(p.minute).padStart(2,'0')+(p.enabled?' ON':' OFF'));
+  }catch(e){toast('ERROR');}
+}
+async function manualOpen(){
+  try{
+    const r=await fetch('/api/open',{method:'POST'});
+    if(!r.ok){throw new Error('open failed');}
+    toast('OPEN REQUESTED');
+  }catch(e){toast('ERROR');}
+}
+async function manualClose(){
+  try{
+    const r=await fetch('/api/close',{method:'POST'});
+    if(!r.ok){throw new Error('close failed');}
+    toast('CLOSE REQUESTED');
+  }catch(e){toast('ERROR');}
+}
+fetchStatus();
+setInterval(fetchStatus,1000);
+</script>
+</body>
+</html>)rawhtml";
+  server.send(200, "text/html", html);
+}
+// ─── SETUP ──────────────────────────────────────────────────────────────────
 void setup() {
-  // Power pin – start LOW (servo unpowered)
-  pinMode(POWER_PIN, OUTPUT);
-  digitalWrite(POWER_PIN, LOW);
-
   Serial.begin(115200);
-  delay(500);
-
-  ESP32PWM::allocateTimer(0);
-  myServo.setPeriodHertz(50);
-  myServo.attach(SERVO_PIN, 400, 2500);
-
-  // Move to closed on boot (power gates automatically inside moveServo)
-  moveServo(POS_CLOSED, "closed");
-
-  loadSchedules();
-  Serial.printf("Loaded %d schedule(s) from flash\n", scheduleCount);
-
-  Serial.printf("\nConnecting to %s", SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(SSID, PASSWORD);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(500); Serial.print(".");
+  Serial.println("\n[BOOT] Water Valve Controller");
+  pinMode(SERVO_ENABLE_PIN, OUTPUT);
+  digitalWrite(SERVO_ENABLE_PIN, LOW);
+  loadSchedule();
+  Serial.printf("[SCHED] S0: %02d:%02d (%s)  S1: %02d:%02d (%s)\n",
+    sched[0].hour, sched[0].minute, sched[0].enabled ? "ON" : "OFF",
+    sched[1].hour, sched[1].minute, sched[1].enabled ? "ON" : "OFF");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("[WIFI] Connecting");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries++ < 30) {
+    delay(500);
+    Serial.print(".");
   }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
-
-    // OTA setup
-    ArduinoOTA.setHostname("change");
-    ArduinoOTA.setPassword("change");   // change this!
-    ArduinoOTA.onStart([]()   { Serial.println("[OTA] Starting..."); });
-    ArduinoOTA.onEnd([]()     { Serial.println("\n[OTA] Done! Rebooting."); });
-    ArduinoOTA.onError([](ota_error_t e) { Serial.printf("[OTA] Error %u\n", e); });
-    ArduinoOTA.begin();
-    Serial.println("[OTA] Ready. Hostname: esp32-gate");
-
-    configTime(UTC_OFFSET, 0, "pool.ntp.org", "time.nist.gov");
-    struct tm t;
-    int tries = 0;
-    while (!getLocalTime(&t) && tries++ < 20) delay(500);
-    if (getLocalTime(&t)) {
-      ntpSynced = true;
-      Serial.printf("[NTP] Synced: %02d:%02d:%02d\n", t.tm_hour, t.tm_min, t.tm_sec);
-    }
+    Serial.println("\n[WIFI] IP: " + WiFi.localIP().toString());
   } else {
-    Serial.println("\n[WiFi] Initial connect failed – retrying in loop...");
-    reconnecting     = true;
-    reconnectStartMs = millis();
+    Serial.println("\n[WIFI] AP fallback");
+    WiFi.softAP("ValveController", "12345678");
+    Serial.println("[AP] 192.168.4.1  pass: 12345678");
+    Serial.println("[TIME] NTP unavailable in AP-only mode; schedules need a valid clock");
   }
-
-  server.on("/",                handleRoot);
-  server.on("/open",            handleOpen);
-  server.on("/closed",          handleClosed);
-  server.on("/status",          handleStatus);
-  server.on("/wifistatus",      handleWifiStatus);
-  server.on("/time",            handleTime);
-  server.on("/schedules",       handleGetSchedules);
-  server.on("/schedule/add",    HTTP_POST, handleAddSchedule);
-  server.on("/schedule/delete", handleDeleteSchedule);
-  server.onNotFound(handleNotFound);
-
+  configTime(GMT_OFFSET_S, DAYLIGHT_S, NTP_SERVER);
+  server.on("/",             HTTP_GET,     handleRoot);
+  server.on("/api/status",   HTTP_GET,     handleGetStatus);
+  server.on("/api/status",   HTTP_OPTIONS, handleOptions);
+  server.on("/api/schedule", HTTP_POST,    handleSetSchedule);
+  server.on("/api/schedule", HTTP_OPTIONS, handleOptions);
+  server.on("/api/open",     HTTP_POST,    handleManualOpen);
+  server.on("/api/open",     HTTP_OPTIONS, handleOptions);
+  server.on("/api/close",    HTTP_POST,    handleManualClose);
+  server.on("/api/close",    HTTP_OPTIONS, handleOptions);
+  server.onNotFound([]() {
+    addCorsHeaders();
+    server.send(404, "text/plain", "Not found");
+  });
   server.begin();
-  Serial.println("HTTP server started.");
+  Serial.println("[HTTP] Server ready");
 }
-
-// ─── LOOP ─────────────────────────────────────────────────────────────────────
+// ─── LOOP ───────────────────────────────────────────────────────────────────
 void loop() {
-  ArduinoOTA.handle();
-  handleWifi();
   server.handleClient();
-  checkSchedules();
+  updateValveStateMachine();
+  static unsigned long lastChk = 0;
+  if (millis() - lastChk >= 1000) {
+    lastChk = millis();
+    checkSchedule();
+  }
 }
